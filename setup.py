@@ -25,10 +25,10 @@ REQUIRED = [
     "zarr",
     "scikit-learn",
     "pandas",
-    #"cupy",
-    #"cucim",
-    #"napari",
-    #"tensorflow>=2.11.0",
+    "cupy",
+    "cucim",
+    "napari",
+    "tensorflow>=2.11.0",
 ]
 
 # What packages are optional?
