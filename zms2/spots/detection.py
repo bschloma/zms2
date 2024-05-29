@@ -12,12 +12,13 @@ import cucim.skimage.measure as cpmeas
 from skimage.measure import regionprops as regionprops_np
 import pandas as pd
 from pathlib import Path
+from iohub.ngff import open_ome_zarr
 
 
 def run_spot_detection(path_to_spot_data, timepoints=None, sigma_blur=5.74, skin_sigma_blur=10.0,
                        skin_thresh=10 ** -1.76,
                        erosion_size=0, xor_size=0, sigma_dog_low=0.68, spot_thresh=0.001,
-                       path_to_spots=r'./spots.pkl', cpu_only=False):
+                       path_to_spots=r'./spots.pkl', cpu_only=False, spot_channel=0):
     """ input path to zarr file and parameters, run spot detection, output a dataframe with spots info. parameters
         can be optimized with the tune_params.py functions in interactives.
         Sketch of algorithm:    -spot mask is made from a simple combination of blurring, DoG, and thresholding.
@@ -50,8 +51,20 @@ def run_spot_detection(path_to_spot_data, timepoints=None, sigma_blur=5.74, skin
     spots_by_time_point_dir = Path(path_to_spots).parent / 'spots_by_time_point'
     spots_by_time_point_dir.mkdir()
 
-    # open zarr array of spot data. likely not in memory if dataset is large. dims=TZYX
-    spot_data = zarr.open(path_to_spot_data, mode='r')
+    # open zarr array of spot data. likely not in memory if dataset is large. account for variable number of dims.
+    # spot_data = zarr.open(path_to_spot_data, mode='r')
+    #data = open_ome_zarr(path_to_spot_data, layout="fov", mode="r")
+    #data = data["0"]
+    synchronizer = zarr.ProcessSynchronizer((Path(path_to_spots).parent.parent / 'sync.sync').__str__())
+    data = zarr.open(path_to_spot_data, mode='r', synchronizer=synchronizer)
+    if len(data.shape) == 4:
+        spot_data = da.from_array(data)
+    elif len(data.shape) == 5:
+        # TCZYX --- convert to dask first.
+        spot_data = da.from_array(data)[:, spot_channel]
+    else:
+        raise ValueError('data has wrong shape')
+
 
     # create output DataFrame where we will store spot info
     #df = pd.DataFrame(columns=['data', 'spot_id', 't', 'z', 'y', 'x', 'manual_classification'])
@@ -65,8 +78,9 @@ def run_spot_detection(path_to_spot_data, timepoints=None, sigma_blur=5.74, skin
     """loop over time and run spot detection. default run uses gpu for initial spot mask creation."""
     for timepoint in tqdm(timepoints):
         # load one timepoint into a dask array
-        data_da = da.from_array(spot_data[timepoint],
-                                chunks=(1, spot_data.shape[2], spot_data.shape[3]))
+        # data_da = da.from_array(spot_data[timepoint],
+        #                         chunks=(1, spot_data.shape[2], spot_data.shape[3]))
+        data_da = da.rechunk(spot_data[timepoint], chunks=(1, spot_data.shape[2], spot_data.shape[3]))
 
         # create spot labels, either with gpu version (default) or cpu version. both return numpy array.
         if cpu_only:
@@ -111,29 +125,38 @@ def run_spot_detection(path_to_spot_data, timepoints=None, sigma_blur=5.74, skin
 
 def create_spot_labels_gpu(data_da, sigma_blur=5.74, skin_sigma_blur=10.0, skin_thresh=10 ** -1.76,
                            erosion_size=0, xor_size=0, sigma_dog_low=0.68, spot_thresh=0.001):
-    # execute gpu-backed spot mask function. return 3D cupy array.
-    # note flexible structure: one function gpu_process can take a cupy-based function as "process" argument
-    # and a list of params. this approach is used to create spot masks and skin masks
-    spot_mask = gpu_process(data_da, params=[sigma_blur, sigma_dog_low, spot_thresh],
-                            process=make_spot_mask).compute()
+    # # execute gpu-backed spot mask function. return 3D cupy array.
+    # # note flexible structure: one function gpu_process can take a cupy-based function as "process" argument
+    # # and a list of params. this approach is used to create spot masks and skin masks
+    # spot_mask = gpu_process(data_da, params=[sigma_blur, sigma_dog_low, spot_thresh],
+    #                         process=make_spot_mask).compute()
+    #
+    # # execute gpu-backed skin mask function. return 3D cupy array.
+    # skin_mask = gpu_process(data_da, params=[skin_sigma_blur, skin_thresh, erosion_size, xor_size],
+    #                         process=make_skin_mask).compute()
+    #
+    # # apply skin mask to spot mask and create label matrix
+    # spot_mask = spot_mask * skin_mask
+    # labels = cpmeas.label(spot_mask)
+    #
+    # # release cupy arrays
+    # skin_mask = cp.asnumpy(skin_mask)
+    # spot_mask = cp.asnumpy(spot_mask)
+    #
+    # # numpy version of regionprops
+    # labels = cp.asnumpy(labels)
+    #
+    # return labels
 
-    # execute gpu-backed skin mask function. return 3D cupy array.
-    skin_mask = gpu_process(data_da, params=[skin_sigma_blur, skin_thresh, erosion_size, xor_size],
-                            process=make_skin_mask).compute()
-
-    # apply skin mask to spot mask and create label matrix
-    spot_mask = spot_mask * skin_mask
-    labels = cpmeas.label(spot_mask)
-
-    # release cupy arrays
-    skin_mask = cp.asnumpy(skin_mask)
-    spot_mask = cp.asnumpy(spot_mask)
-
-    # numpy version of regionprops
-    labels = cp.asnumpy(labels)
+    """Brandon trying to optimize the function for memory 5/27/24"""
+    spot_mask = (gpu_process(data_da, params=[sigma_blur, sigma_dog_low, spot_thresh],
+                             process=make_spot_mask) * gpu_process(data_da, params=[skin_sigma_blur, skin_thresh, erosion_size, xor_size],
+                             process=make_skin_mask)).compute()
+    labels = cp.asnumpy(cpmeas.label(spot_mask))
+    del spot_mask
+    cp._default_memory_pool.free_all_blocks()
 
     return labels
-
 
 def make_spot_mask(arr, params):
     # unpack params
@@ -255,16 +278,25 @@ def extract_locations_arr_from_spots(df):
     return locations
 
 
-def extract_spot_voxels_from_zarr(path_to_zarr, locations, voxel_size=(9, 11, 11)):
-    """pull out voxel of mcp channel data from zarr at 4D points specified by locations. alternative to
+def extract_spot_voxels_from_zarr(path_to_zarr, locations, voxel_size=(9, 11, 11), spot_channel=0):
+    """pull out voxel of mcp channel data from zarr at 4D points specified by locations, an Nx4 numpy array. alternative to
     extract_spot_data above, which uses numpy array. Using this for making manual traces. go straight to creating a
     dataframe"""
 
-    # open a 4D zarr array (out of memory)
+    # open the data (out of memory)
     data = zarr.open(path_to_zarr, 'r')
 
+    # check if the array is 4D (TZYX) or 5D (TCZYX)
+    n_dims = len(data.shape)
+    if (n_dims < 4) | (n_dims > 5):
+        raise ValueError('data must be either 4- or 5-d')
+    five_dims = n_dims == 5
+
     # extract shape of each time point. used for checking if spot is near a boundary
-    im_shape = data.shape[1:]
+    if five_dims:
+        im_shape = data.shape[2:]
+    else:
+        im_shape = data.shape[1:]
 
     # create a dataframe for storing the output
     df = pd.DataFrame()
@@ -274,10 +306,15 @@ def extract_spot_voxels_from_zarr(path_to_zarr, locations, voxel_size=(9, 11, 11
             t0 = int(t0)
             z0 = int(z0)
             y0 = int(y0)
-            x0 = int(x0);
+            x0 = int(x0)
             z, y, x = voxel_size
-            this_voxel = data[t0, (z0 - (z - 1) // 2):(z0 + (z - 1) // 2 + 1), (y0 - (y - 1) // 2):(y0 + (y - 1) // 2) + 1,
-                         (x0 - (x - 1) // 2):(x0 + (x - 1) // 2 + 1)]
+            if five_dims:
+                this_voxel = data[t0, spot_channel, (z0 - (z - 1) // 2):(z0 + (z - 1) // 2 + 1),
+                             (y0 - (y - 1) // 2):(y0 + (y - 1) // 2) + 1,
+                             (x0 - (x - 1) // 2):(x0 + (x - 1) // 2 + 1)]
+            else:
+                this_voxel = data[t0, (z0 - (z - 1) // 2):(z0 + (z - 1) // 2 + 1), (y0 - (y - 1) // 2):(y0 + (y - 1) // 2) + 1,
+                             (x0 - (x - 1) // 2):(x0 + (x - 1) // 2 + 1)]
             if i == 0:
                 df['data'] = [this_voxel]
             else:
